@@ -1,0 +1,101 @@
+# --- Secrets & credentials (never commit) ---
+.env
+.env.*
+!.env.example
+backend/.env
+backend/.env.*
+secrets/
+**/secrets/
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+service-account*.json
+**/key.json
+gcloud-*.json
+token.json
+*.credentials
+
+# Google Cloud application default credentials
+application_default_credentials.json
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+
+# Type checkers / linters
+.mypy_cache/
+.ruff_cache/
+.pytype/
+
+# --- IDE & editor ---
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Logs & local runtime ---
+*.log
+logs/
+tmp/
+temp/
+.cache/
+
+# --- Docker (local volumes / overrides) ---
+docker-compose.override.yml
+.docker/
+
+# --- Jupyter (if used for exploration) ---
+.ipynb_checkpoints/
+
+# --- Local databases / dumps ---
+*.db
+*.sqlite3
+dump.rdb
+*.bson

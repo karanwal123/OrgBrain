@@ -47,18 +47,44 @@ class Settings(BaseSettings):
     mongodb_uri: str = "mongodb://localhost:27017"
     mongodb_database: str = "org_brain"
     mongodb_profiles_collection: str = "employee_profiles"
+    mongodb_memory_collection: str = "channel_memory"
+    mongodb_availability_collection: str = "employee_availability"
+
+    # Postgres
+    postgres_dsn: Optional[str] = None
+
+    # Redis
+    redis_url: Optional[str] = None
+    redis_memory_prefix: str = "org_brain:memory"
+    redis_cache_ttl_seconds: int = 900
+
+    # Memory worker
+    memory_summary_interval_minutes: int = 20
+    memory_retrieval_limit: int = 10
 
     # Qdrant
     qdrant_host: str = "localhost"
     qdrant_port: int = 6333
+    qdrant_url: Optional[str] = Field(
+        default=None,
+        description="Qdrant Cloud cluster URL (preferred over host/port when set)",
+    )
+    qdrant_api_key: Optional[str] = None
     qdrant_collection: str = "skill_embeddings"
+    qdrant_memory_collection: str = "channel_memory_embeddings"
     embedding_dimension: int = 768
+    embedding_model_name: str = "text-embedding-004"
 
     # Slack
     slack_bot_token: Optional[str] = None
     slack_app_token: Optional[str] = None
     slack_signing_secret: Optional[str] = None
     extraction_confidence_threshold: float = 0.3
+
+    # AI call caching
+    ai_cache_enabled: bool = True
+    ai_cache_ttl_seconds: int = 900
+    ai_cache_max_entries: int = 1000
 
     # App
     app_env: str = "development"

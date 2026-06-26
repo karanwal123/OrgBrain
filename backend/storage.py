@@ -9,7 +9,7 @@ from pymongo.collection import Collection
 from pymongo.database import Database
 
 from backend.config import Settings, get_settings
-from backend.schemas import EmployeeProfile, ExtractionResult
+from backend.schemas import ChannelMemoryState, EmployeeProfile, ExtractionResult
 
 logger = logging.getLogger(__name__)
 
@@ -227,3 +227,64 @@ class ProfileStorage:
         """
         result = self._collection.delete_one({"person": person})
         return result.deleted_count > 0
+
+
+class MemoryStorage:
+    """MongoDB-backed durable storage for per-channel compressed memory."""
+
+    def __init__(self, settings: Optional[Settings] = None):
+        self.settings = settings or get_settings()
+        self._client = MongoClient(self.settings.mongodb_uri)
+        self._db: Database = self._client[self.settings.mongodb_database]
+        self._collection: Collection = self._db[self.settings.mongodb_memory_collection]
+        self._ensure_indexes()
+
+    def _ensure_indexes(self) -> None:
+        self._collection.create_index("channel_id", unique=True)
+        self._collection.create_index("updated_at")
+        self._collection.create_index("pending_message_payloads")
+
+    def close(self) -> None:
+        self._client.close()
+
+    def get_state(self, channel_id: str) -> Optional[ChannelMemoryState]:
+        doc = self._collection.find_one({"channel_id": channel_id})
+        if not doc:
+            return None
+        doc.pop("_id", None)
+        return ChannelMemoryState.model_validate(doc)
+
+    def save_state(self, state: ChannelMemoryState) -> ChannelMemoryState:
+        payload = state.model_dump(mode="python")
+        self._collection.update_one(
+            {"channel_id": state.channel_id},
+            {"$set": payload},
+            upsert=True,
+        )
+        logger.debug("Saved channel memory state channel=%s units=%d", state.channel_id, len(state.memory_store))
+        return state
+
+    def list_channel_ids(self) -> list[str]:
+        return [
+            doc["channel_id"]
+            for doc in self._collection.find({}, {"channel_id": 1, "_id": 0})
+        ]
+
+    def list_channels_with_pending(self) -> list[str]:
+        cursor = self._collection.find(
+            {"pending_message_payloads.0": {"$exists": True}},
+            {"channel_id": 1, "_id": 0},
+        )
+        return [doc["channel_id"] for doc in cursor]
+
+    def ping(self) -> dict:
+        self._client.admin.command("ping")
+        count = self._collection.count_documents({})
+        pending = self._collection.count_documents({"pending_message_payloads.0": {"$exists": True}})
+        return {
+            "status": "ok",
+            "database": self.settings.mongodb_database,
+            "collection": self.settings.mongodb_memory_collection,
+            "channel_count": count,
+            "channels_with_pending": pending,
+        }

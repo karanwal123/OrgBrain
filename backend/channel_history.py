@@ -5,6 +5,12 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
+from backend.cache import TTLCache
+
+# Cache fetched messages for 2 minutes — ensures repeated /summarize calls within the
+# window use IDENTICAL messages_json, enabling _SUMMARY_CACHE hits downstream.
+_MESSAGES_CACHE: TTLCache[tuple] = TTLCache(ttl_seconds=120, max_entries=200)
+
 logger = logging.getLogger(__name__)
 
 SLACK_USER_ID_PATTERN = re.compile(r"^U[A-Z0-9]{8,}$", re.IGNORECASE)
@@ -87,6 +93,7 @@ def parse_summarize_args(text: str) -> tuple[Optional[str], str]:
         "#hackathon- last 2 days" -> ("hackathon-", "last 2 days")
         "last 24 hours" -> (None, "last 24 hours")
         "#payment-migration 1 week" -> ("payment-migration", "1 week")
+        "*#hackathon-* • Last 24 hours" -> ("hackathon-", "Last 24 hours")  # Slack modal format
 
     Returns:
         (channel_name_without_hash or None, timeframe_string)
@@ -94,6 +101,12 @@ def parse_summarize_args(text: str) -> tuple[Optional[str], str]:
     text = text.strip()
     if not text:
         return None, "last 24 hours"
+
+    # Strip Slack markdown formatting that appears when the modal passes text back
+    # e.g. "*#hackathon-* • Last 24 hours" -> "#hackathon- Last 24 hours"
+    text = re.sub(r"\*([^*]+)\*", r"\1", text)   # *bold* -> plain
+    text = re.sub(r"[•·|]", " ", text)             # bullet/pipe separators -> space
+    text = re.sub(r"\s{2,}", " ", text).strip()   # collapse whitespace
 
     channel_match = re.match(r"#([\w-]+)\s*(.*)", text)
     if channel_match:
@@ -202,7 +215,7 @@ def _prime_user_cache(client: Any, cache: dict[str, str]) -> None:
             cache[name.lower()] = name
 
         cursor = resp.get("response_metadata", {}).get("next_cursor")
-        if not cursor:
+        if not isinstance(cursor, str) or not cursor:
             break
 
 
@@ -271,6 +284,19 @@ def fetch_channel_messages(
     Raises:
         ChannelHistoryError: If history cannot be fetched or channel is inaccessible.
     """
+    # Bucket oldest_ts to the nearest 3600-second (1-hour) boundary so requests
+    # within the same clock-hour share the same cache key. Using 60s was too fine —
+    # "last 24 hours" shifts by seconds each call, causing constant cache misses.
+    ts_bucket = int(oldest_ts // 3600) * 3600
+    cache_key = (channel_id, ts_bucket, limit)
+    cached = _MESSAGES_CACHE.get(cache_key)
+    if cached is not None:
+        cached_messages, cached_user_cache = cached
+        print(f"   [Messages Cache HIT] Reusing {len(cached_messages)} cached messages for channel {channel_id} (bucket={ts_bucket})")
+        return list(cached_messages), dict(cached_user_cache)
+
+    print(f"   [Messages Cache MISS] Fetching fresh messages from Slack for channel {channel_id} (bucket={ts_bucket})")
+
     messages: list[dict[str, Any]] = []
     user_cache: dict[str, str] = {}
     cursor: Optional[str] = None
@@ -334,8 +360,11 @@ def fetch_channel_messages(
             )
 
         cursor = resp.get("response_metadata", {}).get("next_cursor")
-        if not cursor:
+        if not isinstance(cursor, str) or not cursor:
             break
 
     messages.sort(key=lambda m: m["ts"])
-    return messages[:limit], dict(user_cache)
+    result = messages[:limit], dict(user_cache)
+    _MESSAGES_CACHE.set(cache_key, result)
+    print(f"   [Messages Cache SET] Cached {len(result[0])} messages for channel {channel_id} (bucket={ts_bucket}, TTL=120s)")
+    return result

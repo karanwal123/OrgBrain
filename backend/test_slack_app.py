@@ -15,6 +15,7 @@ from backend.slack_app import (
     is_processable_message,
     resolve_help_profiles,
     summarize_slash_command,
+    recall_slash_command,
 )
 from backend.extraction import fallback_profile_about
 
@@ -296,6 +297,11 @@ class TestSummarizeSlashCommand:
 class TestFetchChannelMessages:
     """Tests for Slack history name resolution fallbacks."""
 
+    def setup_method(self):
+        from backend.channel_history import _MESSAGES_CACHE
+        with _MESSAGES_CACHE._lock:
+            _MESSAGES_CACHE._items.clear()
+
     def test_users_list_preeseds_real_names_for_messages(self):
         client = MagicMock()
         client.users_list.return_value = {
@@ -423,3 +429,91 @@ class TestSearchBySkill:
             results = storage.search_by_skill("kubernetes")
             assert len(results) == 1
             assert results[0].person == "Priya Sharma"
+
+
+class TestRecallSlashCommand:
+    """Tests for /recall handler behavior."""
+
+    def test_missing_query_returns_usage(self):
+        respond = MagicMock()
+        client = MagicMock()
+        recall_slash_command(
+            {
+                "text": "   ",
+                "channel_id": "C123",
+                "user_name": "Aditya",
+            },
+            client,
+            respond,
+            MagicMock(),
+        )
+        respond.assert_called_once()
+        payload = respond.call_args.kwargs
+        assert payload["response_type"] == "ephemeral"
+        assert "Usage: `/recall <search query>`" in payload["text"]
+
+    def test_missing_memory_service_returns_error(self):
+        respond = MagicMock()
+        client = MagicMock()
+        recall_slash_command(
+            {
+                "text": "redis",
+                "channel_id": "C123",
+                "user_name": "Aditya",
+            },
+            client,
+            respond,
+            None,
+        )
+        respond.assert_called_once()
+        payload = respond.call_args.kwargs
+        assert "unavailable" in payload["text"]
+
+    def test_executes_search_successfully(self):
+        from backend.schemas import MemoryRetrievalHit, MemoryUnitType
+        
+        respond = MagicMock()
+        client = MagicMock()
+        mock_memory_service = MagicMock()
+        
+        # Mock search hits
+        mock_memory_service.search.return_value = [
+            MemoryRetrievalHit(
+                memory_id="123",
+                channel_id="C456",
+                summary="Redis cluster migration completed.",
+                unit_type=MemoryUnitType.decision,
+                score=0.95,
+                semantic_score=0.95,
+                recency_score=0.9,
+                importance_score=0.9,
+                unresolved_score=0.0,
+                owners=["Aditya"],
+                tags=["redis", "migration"],
+            )
+        ]
+        
+        recall_slash_command(
+            {
+                "text": "redis",
+                "channel_id": "C123",
+                "user_name": "Aditya",
+            },
+            client,
+            respond,
+            mock_memory_service,
+        )
+        
+        mock_memory_service.flush_channel.assert_called_once_with("C123")
+        mock_memory_service.search.assert_called_once_with("redis", limit=5)
+        respond.assert_called_once()
+        payload = respond.call_args.kwargs
+        assert payload["response_type"] == "ephemeral"
+        assert "blocks" in payload
+        blocks = payload["blocks"]
+        assert len(blocks) > 0
+        body = str(blocks)
+        assert "Redis cluster migration completed" in body
+        assert "<#C456>" in body
+        assert "Aditya" in body
+

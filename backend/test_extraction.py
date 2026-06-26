@@ -4,7 +4,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from backend.extraction import ExtractionError, extract_employee_info
+from backend.extraction import ExtractionError, extract_employee_info, extract_help_topics
 from backend.schemas import ExtractionResult
 
 # 10 realistic fake Slack messages for extraction testing.
@@ -203,6 +203,34 @@ class TestExtractEmployeeInfo:
         model = MagicMock()
         with pytest.raises(ExtractionError):
             extract_employee_info("\n\t  ", model)
+
+    def test_repeated_message_uses_cache(self):
+        """Same input with same model should hit extraction cache."""
+        expected = EXPECTED_EXTRACTIONS[0]
+        model = _mock_model_response(expected)
+
+        first = extract_employee_info(FAKE_SLACK_MESSAGES[0], model)
+        second = extract_employee_info(FAKE_SLACK_MESSAGES[0], model)
+
+        assert first.person == second.person
+        model.generate_content.assert_called_once()
+
+
+class TestExtractHelpTopics:
+    """Tests for help topic extraction cache behavior."""
+
+    def test_repeated_help_query_uses_cache(self):
+        model = MagicMock()
+        model.generate_content.return_value = MagicMock(
+            text='{"topics": ["Kubernetes"], "summary": "Kubernetes deploy issue", "confidence": 0.9}'
+        )
+
+        first = extract_help_topics("Need help with Kubernetes deployment", model)
+        second = extract_help_topics("Need help with Kubernetes deployment", model)
+
+        assert first.topics == ["Kubernetes"]
+        assert second.summary == "Kubernetes deploy issue"
+        model.generate_content.assert_called_once()
 
 
 class TestFakeMessageCorpus:

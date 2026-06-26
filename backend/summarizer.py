@@ -1,6 +1,7 @@
 """Channel summarization via Gemini and Block Kit modal formatting."""
 
 from collections import Counter
+import hashlib
 import json
 import logging
 import re
@@ -9,11 +10,20 @@ from typing import Any, Optional
 
 from vertexai.generative_models import GenerationConfig, GenerativeModel
 
+from backend.cache import TTLCache
 from backend.channel_history import build_user_lookup
+from backend.config import get_settings
 from backend.extraction import ExtractionError, _strip_json_fences
-from backend.schemas import ChannelSummary, TimelineEvent
+from backend.schemas import ChannelMemoryState, ChannelSummary, MemoryUnitType, TimelineEvent, MemoryRetrievalHit
 
 logger = logging.getLogger(__name__)
+
+_SETTINGS = get_settings()
+_AI_CACHE_ENABLED = _SETTINGS.ai_cache_enabled
+_SUMMARY_CACHE: TTLCache[ChannelSummary] = TTLCache(
+    ttl_seconds=_SETTINGS.ai_cache_ttl_seconds,
+    max_entries=_SETTINGS.ai_cache_max_entries,
+)
 
 HEALTH_EMOJI = {
     "healthy": "🟢",
@@ -105,8 +115,8 @@ Analyze the discussion and return JSON only with this structure:
     {{
       "problem": "...",
       "reported_by": "name",
-      "solution": "...",
-      "fixed_by": "name",
+      "solution": "resolution details, or null if unresolved",
+      "fixed_by": "name of person, or null if unresolved",
       "timestamp": "optional",
       "impact": "optional"
     }}
@@ -148,6 +158,12 @@ def _messages_to_prompt_json(messages: list[dict[str, Any]]) -> str:
     return "[\n" + ",\n".join(lines) + "\n]"
 
 
+def _model_cache_key(model: GenerativeModel) -> str:
+    """Build a stable model identifier for cache key partitioning."""
+    model_name = getattr(model, "_model_name", None) or getattr(model, "model_name", None)
+    return str(model_name) if model_name else f"model@{id(model)}"
+
+
 def _build_fallback_narrative(messages: list[dict[str, Any]], timeframe: str) -> str:
     """Build a concise human-readable summary from raw messages."""
     speakers = {
@@ -177,21 +193,51 @@ def _build_fallback_narrative(messages: list[dict[str, Any]], timeframe: str) ->
 
 
 def _parse_json_payload(raw_text: str) -> Any:
-    """Parse JSON from model output, tolerating extra prose around the payload."""
+    """Parse JSON from model output, tolerating extra prose around the payload.
+
+    Strategies tried in order:
+    1. Direct json.loads after stripping markdown fences
+    2. json.JSONDecoder.raw_decode from every '{' and '[' position
+    3. Regex extraction of the outermost { ... } block
+    4. Trailing-comma cleanup + retry
+    """
     cleaned = _strip_json_fences(raw_text)
+
+    # Strategy 1: direct parse
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
-        decoder = json.JSONDecoder()
-        for start in (cleaned.find("{"), cleaned.find("[")):
+        pass
+
+    # Strategy 2: raw_decode from every candidate start position
+    decoder = json.JSONDecoder()
+    for char in ("{", "["):
+        start = -1
+        while True:
+            start = cleaned.find(char, start + 1)
             if start < 0:
-                continue
+                break
             try:
                 payload, _ = decoder.raw_decode(cleaned[start:])
                 return payload
             except json.JSONDecodeError:
                 continue
-        raise
+
+    # Strategy 3: regex to grab the outermost { ... } block
+    obj_match = re.search(r"\{[\s\S]*\}", cleaned)
+    if obj_match:
+        candidate = obj_match.group(0)
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            # Strategy 4: strip trailing commas before } or ]
+            fixed = re.sub(r",\s*([}\]])", r"\1", candidate)
+            try:
+                return json.loads(fixed)
+            except json.JSONDecodeError:
+                pass
+
+    raise json.JSONDecodeError("No valid JSON found in model output", cleaned, 0)
 
 
 def _parse_channel_summary(raw_text: str, channel: str, timeframe: str) -> ChannelSummary:
@@ -205,6 +251,14 @@ def _parse_channel_summary(raw_text: str, channel: str, timeframe: str) -> Chann
         payload.setdefault("timeframe", timeframe)
         return ChannelSummary.model_validate(payload)
     except (json.JSONDecodeError, ValueError) as exc:
+        # Log the raw output for debugging
+        preview = raw_text[:500] if raw_text else "(empty)"
+        print(f"[PARSE FAIL] Channel summary raw LLM output ({len(raw_text)} chars):\n{preview}")
+        logger.warning(
+            "Channel summary parse failed (detail=%s). Raw preview: %s",
+            str(exc),
+            preview,
+        )
         raise ExtractionError(
             "Failed to parse channel summary response",
             detail=str(exc),
@@ -269,6 +323,30 @@ def summarize_channel(
         )
 
     messages_json = _messages_to_prompt_json(messages)
+    msg_hash = hashlib.sha1(messages_json.encode()).hexdigest()[:10]
+    model_key = _model_cache_key(model)
+    cache_key = (
+        model_key,
+        round(float(temperature), 3),
+        channel,
+        timeframe,
+        messages_json,
+    )
+    print(f"   [SUMMARIZE Cache Key] channel={channel} timeframe={timeframe} msgs={len(messages)} hash={msg_hash} model={model_key}")
+    if _AI_CACHE_ENABLED:
+        cached = _SUMMARY_CACHE.get(cache_key)
+        if cached is not None:
+            print(f"")
+            print(f"   +------------------------------------------------------+")
+            print(f"   |  [CACHE HIT] SUMMARY CACHE HIT - No Gemini needed!   |")
+            print(f"   |  Channel : {channel:<42}|")
+            print(f"   |  Hash    : {msg_hash:<42}|")
+            print(f"   |  Serving cached result instantly (O(1))              |")
+            print(f"   +------------------------------------------------------+")
+            print(f"")
+            lookup = build_user_lookup(messages, user_cache)
+            return apply_name_resolution(cached.model_copy(deep=True), lookup)
+
     prompt = SUMMARIZE_PROMPT.format(
         channel=channel,
         timeframe=timeframe,
@@ -282,24 +360,38 @@ def summarize_channel(
             generation_config=GenerationConfig(
                 temperature=temperature,
                 response_mime_type="application/json",
+                max_output_tokens=4096,
             ),
         )
         raw_text = response.text or ""
         if not raw_text.strip():
-            return fallback_channel_summary(channel, timeframe, messages)
+            fallback = fallback_channel_summary(channel, timeframe, messages)
+            if _AI_CACHE_ENABLED:
+                _SUMMARY_CACHE.set(cache_key, fallback)
+                print(f"[SUMMARIZE] Empty response — cached fallback for {channel}")
+            return apply_name_resolution(fallback.model_copy(deep=True), build_user_lookup(messages, user_cache))
         summary = _parse_channel_summary(raw_text, channel, timeframe)
+        print(f"[SUMMARIZE] OK for {channel}: health={summary.health}, timeline={len(summary.timeline)} events, action_items={len(summary.action_items)}")
+        if _AI_CACHE_ENABLED:
+            _SUMMARY_CACHE.set(cache_key, summary)
+            print(f"[SUMMARIZE] Stored in cache (key hash={msg_hash})")
         lookup = build_user_lookup(messages, user_cache)
-        return apply_name_resolution(summary, lookup)
+        return apply_name_resolution(summary.model_copy(deep=True), lookup)
     except ExtractionError as exc:
+        print(f"[SUMMARIZE] WARN: Parse failed for {channel} -- caching fallback so next call is instant. Detail: {exc.detail}")
         logger.warning("Channel summary parse failed: %s", exc.message)
-        return apply_name_resolution(
-            fallback_channel_summary(channel, timeframe, messages),
-            build_user_lookup(messages, user_cache),
-        )
+        fallback = fallback_channel_summary(channel, timeframe, messages)
+        if _AI_CACHE_ENABLED:
+            _SUMMARY_CACHE.set(cache_key, fallback)
+        lookup = build_user_lookup(messages, user_cache)
+        return apply_name_resolution(fallback.model_copy(deep=True), lookup)
     except Exception as exc:
         logger.exception("Channel summarization failed")
+        fallback = fallback_channel_summary(channel, timeframe, messages)
+        if _AI_CACHE_ENABLED:
+            _SUMMARY_CACHE.set(cache_key, fallback)
         return apply_name_resolution(
-            fallback_channel_summary(channel, timeframe, messages),
+            fallback.model_copy(deep=True),
             build_user_lookup(messages, user_cache),
         )
 
@@ -380,8 +472,8 @@ def apply_name_resolution(summary: ChannelSummary, lookup: dict[str, str]) -> Ch
             update={
                 "problem": _resolve_text_mentions(p.problem, lookup),
                 "reported_by": resolve_person_name(p.reported_by, lookup),
-                "solution": _resolve_text_mentions(p.solution, lookup),
-                "fixed_by": resolve_person_name(p.fixed_by, lookup),
+                "solution": _resolve_text_mentions(p.solution, lookup) if p.solution else None,
+                "fixed_by": resolve_person_name(p.fixed_by, lookup) if p.fixed_by else None,
             }
         )
         for p in summary.problems
@@ -543,7 +635,8 @@ def format_block_kit(summary: ChannelSummary) -> dict[str, Any]:
             ts = f" ({p.timestamp})" if p.timestamp else ""
             line = f"🔴 *{p.problem}*{ts}\n   Reported by: {_mention(p.reported_by)}"
             if p.solution:
-                line += f"\n   ✓ Solution: {p.solution} — {_mention(p.fixed_by)}"
+                fixed_by_str = f" — {_mention(p.fixed_by)}" if p.fixed_by else ""
+                line += f"\n   ✓ Solution: {p.solution}{fixed_by_str}"
             if p.impact:
                 line += f"\n   Impact: {p.impact}"
             problem_lines.append(line)
@@ -611,3 +704,194 @@ def format_block_kit(summary: ChannelSummary) -> dict[str, Any]:
         },
         "blocks": blocks,
     }
+
+def format_memory_modal(state, channel_name):
+    """Build a Block Kit modal from pre-built ChannelMemoryState. O(1): no Slack fetch, no Gemini."""
+    from datetime import datetime, timezone
+    from backend.schemas import MemoryUnitType
+
+    now = datetime.now(timezone.utc)
+    age_str = "just now"
+    if state.last_summary_ts:
+        age_sec = int((now - state.last_summary_ts.astimezone(timezone.utc)).total_seconds())
+        if age_sec < 60:
+            age_str = "just now"
+        elif age_sec < 3600:
+            age_str = f"{age_sec // 60}m ago"
+        else:
+            age_str = f"{age_sec // 3600}h ago"
+
+    label = channel_name if channel_name.startswith("#") else f"#{channel_name}"
+    unit_count = len(state.memory_store)
+
+    def esc(t):
+        return t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    blocks = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": (
+            f"*{esc(label)}* -- Persistent Memory\n"
+            f":zap: Served from memory ({unit_count} units, updated {age_str})"
+        )}},
+        {"type": "divider"},
+    ]
+
+    by_type = {}
+    for unit in sorted(state.memory_store, key=lambda u: u.importance, reverse=True):
+        by_type.setdefault(unit.unit_type.value, []).append(unit)
+
+    type_labels = {
+        "decision":         ("Decisions",    ">>"),
+        "problem":          ("Problems",     "[!]"),
+        "unresolved_issue": ("Open Issues",  "[?]"),
+        "action_item":      ("Action Items", "->"),
+        "agreement":        ("Agreements",   "[ok]"),
+        "context":          ("Context",      "--"),
+    }
+
+    shown_any = False
+    for unit_type_val, (section_label, icon) in type_labels.items():
+        units = by_type.get(unit_type_val, [])
+        if not units:
+            continue
+        lines = []
+        for unit in units[:5]:
+            flag = " [OPEN]" if unit.unresolved else ""
+            owners = f" -- {', '.join(unit.owners)}" if unit.owners else ""
+            lines.append(f"{icon} {esc(unit.summary)}{owners}{flag}")
+
+
+def format_memory_modal(state, channel_name):
+    """Build a Block Kit modal from pre-built ChannelMemoryState. O(1): no Slack fetch, no Gemini."""
+    from datetime import datetime, timezone
+    from backend.schemas import MemoryUnitType
+
+    now = datetime.now(timezone.utc)
+    age_str = "just now"
+    if state.last_summary_ts:
+        age_sec = int((now - state.last_summary_ts.astimezone(timezone.utc)).total_seconds())
+        if age_sec < 60:
+            age_str = "just now"
+        elif age_sec < 3600:
+            age_str = f"{age_sec // 60}m ago"
+        else:
+            age_str = f"{age_sec // 3600}h ago"
+
+    label = channel_name if channel_name.startswith("#") else f"#{channel_name}"
+    unit_count = len(state.memory_store)
+
+    def esc(t):
+        return t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    blocks = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": (
+            f"*{esc(label)}* -- Persistent Memory\n"
+            f":zap: Served from memory ({unit_count} units, updated {age_str})"
+        )}},
+        {"type": "divider"},
+    ]
+
+    by_type = {}
+    for unit in sorted(state.memory_store, key=lambda u: u.importance, reverse=True):
+        by_type.setdefault(unit.unit_type.value, []).append(unit)
+
+    type_labels = {
+        "decision":         ("Decisions",    ">>"),
+        "problem":          ("Problems",     "[!]"),
+        "unresolved_issue": ("Open Issues",  "[?]"),
+        "action_item":      ("Action Items", "->"),
+        "agreement":        ("Agreements",   "[ok]"),
+        "context":          ("Context",      "--"),
+    }
+
+    shown_any = False
+    for unit_type_val, (section_label, icon) in type_labels.items():
+        units = by_type.get(unit_type_val, [])
+        if not units:
+            continue
+        lines = []
+        for unit in units[:5]:
+            flag = " [OPEN]" if unit.unresolved else ""
+            owners = f" -- {', '.join(unit.owners)}" if unit.owners else ""
+            lines.append(f"{icon} {esc(unit.summary)}{owners}{flag}")
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*{section_label}*\n" + "\n".join(lines)}})
+        blocks.append({"type": "divider"})
+        shown_any = True
+
+    if not shown_any:
+        ctx = state.cached_summary_state or state.compressed_context
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*Memory Snapshot*\n{esc(ctx[:2000])}"}})
+
+    generated_at = now.strftime("%b %d, %Y %H:%M UTC")
+    blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": f"OrgBrain Persistent Memory -- {generated_at} -- No Gemini call made"}]})
+
+    return {
+        "type": "modal",
+        "callback_id": "summary_modal",
+        "title": {"type": "plain_text", "text": f"Memory: {label.lstrip('#')[:20]}"},
+        "blocks": blocks,
+    }
+
+
+def format_recall_results(query: str, hits: list[MemoryRetrievalHit]) -> dict[str, Any]:
+    """Build a Block Kit message structure for search recall results."""
+    def esc(t):
+        return t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    blocks: list[dict[str, Any]] = [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"🔍 *Recall Results for:* \"{esc(query)}\""
+            }
+        },
+        {"type": "divider"}
+    ]
+
+    type_emojis = {
+        "decision": "📌",
+        "problem": "🔴",
+        "unresolved_issue": "❓",
+        "action_item": "📋",
+        "agreement": "🤝",
+        "context": "💬",
+    }
+
+    if not hits:
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": "_No memories found matching your query._"
+            }
+        })
+    else:
+        for hit in hits:
+            emoji = type_emojis.get(hit.unit_type.value if hasattr(hit.unit_type, "value") else str(hit.unit_type), "•")
+            owners_str = f" · Owners: {', '.join(hit.owners)}" if hit.owners else ""
+            tags_str = f" · Tags: {', '.join(hit.tags)}" if hit.tags else ""
+            score_percentage = int(hit.score * 100)
+            
+            blocks.append({
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        f"{emoji} *{esc(hit.summary)}*\n"
+                        f"Scope: <#{hit.channel_id}> · Score: {score_percentage}%{owners_str}{tags_str}"
+                    )
+                }
+            })
+            blocks.append({"type": "divider"})
+
+    blocks.append({
+        "type": "context",
+        "elements": [
+            {
+                "type": "mrkdwn",
+                "text": "Org Brain · Semantic Search Recall"
+            }
+        ]
+    })
+
+    return {"blocks": blocks}

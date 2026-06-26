@@ -7,9 +7,30 @@ from typing import Optional
 
 from vertexai.generative_models import GenerationConfig, GenerativeModel
 
+from backend.cache import TTLCache
+from backend.config import get_settings
 from backend.schemas import ExtractionResult, HelpQueryResult, MatchReasonsResult, ProfileAboutResult
 
 logger = logging.getLogger(__name__)
+
+_SETTINGS = get_settings()
+_AI_CACHE_ENABLED = _SETTINGS.ai_cache_enabled
+_EXTRACTION_CACHE: TTLCache[ExtractionResult] = TTLCache(
+    ttl_seconds=_SETTINGS.ai_cache_ttl_seconds,
+    max_entries=_SETTINGS.ai_cache_max_entries,
+)
+_HELP_CACHE: TTLCache[HelpQueryResult] = TTLCache(
+    ttl_seconds=_SETTINGS.ai_cache_ttl_seconds,
+    max_entries=_SETTINGS.ai_cache_max_entries,
+)
+_MATCH_REASONS_CACHE: TTLCache[dict[str, str]] = TTLCache(
+    ttl_seconds=_SETTINGS.ai_cache_ttl_seconds,
+    max_entries=_SETTINGS.ai_cache_max_entries,
+)
+_PROFILE_ABOUT_CACHE: TTLCache[ProfileAboutResult] = TTLCache(
+    ttl_seconds=_SETTINGS.ai_cache_ttl_seconds,
+    max_entries=_SETTINGS.ai_cache_max_entries,
+)
 
 EXTRACTION_PROMPT = """You are an organizational intelligence extractor for workplace Slack messages.
 
@@ -58,6 +79,12 @@ class ExtractionError(Exception):
         self.detail = detail
 
 
+def _model_cache_key(model: GenerativeModel) -> str:
+    """Build a stable model identifier for cache key partitioning."""
+    model_name = getattr(model, "_model_name", None) or getattr(model, "model_name", None)
+    return str(model_name) if model_name else f"model@{id(model)}"
+
+
 def _strip_json_fences(text: str) -> str:
     """Remove markdown code fences from model output."""
     cleaned = text.strip()
@@ -101,7 +128,19 @@ def extract_employee_info(
     if not message or not message.strip():
         raise ExtractionError("Message is empty")
 
-    prompt = EXTRACTION_PROMPT.format(message=message.strip())
+    cleaned_message = message.strip()
+    cache_key = (
+        _model_cache_key(model),
+        round(float(temperature), 3),
+        cleaned_message,
+    )
+    if _AI_CACHE_ENABLED:
+        cached = _EXTRACTION_CACHE.get(cache_key)
+        if cached is not None:
+            print(f"   [AI Cache HIT] Found cached employee profile extraction for message: \"{cleaned_message[:60]}...\"")
+            return cached.model_copy(deep=True)
+
+    prompt = EXTRACTION_PROMPT.format(message=cleaned_message)
 
     try:
         response = model.generate_content(
@@ -114,7 +153,10 @@ def extract_employee_info(
         raw_text = response.text or ""
         if not raw_text.strip():
             raise ExtractionError("Vertex AI returned an empty response")
-        return _parse_extraction_response(raw_text)
+        parsed = _parse_extraction_response(raw_text)
+        if _AI_CACHE_ENABLED:
+            _EXTRACTION_CACHE.set(cache_key, parsed)
+        return parsed.model_copy(deep=True)
     except ExtractionError:
         raise
     except Exception as exc:
@@ -160,7 +202,19 @@ def extract_help_topics(
     if not message or not message.strip():
         raise ExtractionError("Message is empty")
 
-    prompt = HELP_TOPICS_PROMPT.format(message=message.strip())
+    cleaned_message = message.strip()
+    cache_key = (
+        _model_cache_key(model),
+        round(float(temperature), 3),
+        cleaned_message,
+    )
+    if _AI_CACHE_ENABLED:
+        cached = _HELP_CACHE.get(cache_key)
+        if cached is not None:
+            print(f"   [AI Cache HIT] Found cached help topics for query: \"{cleaned_message[:60]}...\"")
+            return cached.model_copy(deep=True)
+
+    prompt = HELP_TOPICS_PROMPT.format(message=cleaned_message)
 
     try:
         response = model.generate_content(
@@ -173,7 +227,10 @@ def extract_help_topics(
         raw_text = response.text or ""
         if not raw_text.strip():
             raise ExtractionError("Vertex AI returned an empty response")
-        return _parse_help_response(raw_text)
+        parsed = _parse_help_response(raw_text)
+        if _AI_CACHE_ENABLED:
+            _HELP_CACHE.set(cache_key, parsed)
+        return parsed.model_copy(deep=True)
     except ExtractionError:
         raise
     except Exception as exc:
@@ -285,6 +342,18 @@ def generate_match_reasons(
         return {}
 
     profiles_json = json.dumps([_profile_to_match_dict(p) for p in profiles], indent=2)
+    cache_key = (
+        _model_cache_key(model),
+        round(float(temperature), 3),
+        context.strip(),
+        profiles_json,
+    )
+    if _AI_CACHE_ENABLED:
+        cached = _MATCH_REASONS_CACHE.get(cache_key)
+        if cached is not None:
+            print(f"   [AI Cache HIT] Found cached match reasons for context: \"{context[:60]}...\"")
+            return dict(cached)
+
     prompt = MATCH_REASONS_PROMPT.format(
         context=context.strip(),
         profiles_json=profiles_json,
@@ -302,7 +371,10 @@ def generate_match_reasons(
         if not raw_text.strip():
             return {}
         result = _parse_match_reasons_response(raw_text)
-        return {r.person: r.reason for r in result.reasons}
+        parsed = {r.person: r.reason for r in result.reasons}
+        if _AI_CACHE_ENABLED:
+            _MATCH_REASONS_CACHE.set(cache_key, parsed)
+        return dict(parsed)
     except ExtractionError as exc:
         logger.warning("Match reason generation failed: %s", exc.message)
         return {}
@@ -368,6 +440,17 @@ def generate_profile_about(
         ExtractionError: If generation or parsing fails.
     """
     profile_json = json.dumps(_profile_to_match_dict(profile), indent=2)
+    cache_key = (
+        _model_cache_key(model),
+        round(float(temperature), 3),
+        profile_json,
+    )
+    if _AI_CACHE_ENABLED:
+        cached = _PROFILE_ABOUT_CACHE.get(cache_key)
+        if cached is not None:
+            print(f"   [AI Cache HIT] Found cached profile card info for {profile.person}")
+            return cached.model_copy(deep=True)
+
     prompt = PROFILE_ABOUT_PROMPT.format(profile_json=profile_json)
 
     try:
@@ -381,7 +464,10 @@ def generate_profile_about(
         raw_text = response.text or ""
         if not raw_text.strip():
             raise ExtractionError("Vertex AI returned an empty response")
-        return _parse_profile_about_response(raw_text)
+        parsed = _parse_profile_about_response(raw_text)
+        if _AI_CACHE_ENABLED:
+            _PROFILE_ABOUT_CACHE.set(cache_key, parsed)
+        return parsed.model_copy(deep=True)
     except ExtractionError:
         raise
     except Exception as exc:

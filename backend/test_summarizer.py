@@ -267,6 +267,35 @@ class TestSummarizeChannel:
         summary = fallback_channel_summary("#test", "Today", [])
         assert summary.participant_count == 0
 
+    def test_repeated_summary_request_uses_cache(self):
+        mock_model = MagicMock()
+        mock_model.generate_content.return_value = MagicMock(
+            text=json.dumps(
+                {
+                    "channel": "#hackathon-",
+                    "timeframe": "Last 2 days",
+                    "health": "healthy",
+                    "participant_count": 1,
+                    "decision_count": 0,
+                    "timeline": [],
+                    "decisions": [],
+                    "problems": [],
+                    "action_items": [],
+                    "narrative": "Good progress.",
+                }
+            )
+        )
+        messages = [
+            {"time_label": "Jun 13, 10:00", "user_name": "Rahul", "text": "DB timeout issue"},
+        ]
+
+        first = summarize_channel(messages, "#hackathon-", "Last 2 days", mock_model)
+        second = summarize_channel(messages, "#hackathon-", "Last 2 days", mock_model)
+
+        assert first.health == "healthy"
+        assert second.narrative == "Good progress."
+        mock_model.generate_content.assert_called_once()
+
 
 class TestNameResolution:
     """Tests for Slack user ID → display name resolution."""

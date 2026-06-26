@@ -145,3 +145,7 @@ python -m backend.slack_app
 | No profiles returned | Check terminal for `Learned profile update` logs after posting |
 | `/summarize` empty | Invite bot to channel; ensure messages exist in timeframe |
 | Summary modal stuck loading | Check terminal for Gemini errors; verify GCP credentials |
+
+
+.\.venv\Scripts\Activate.ps1
+python -m backend.slack_app

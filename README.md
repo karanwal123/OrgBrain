@@ -1,131 +1,122 @@
-# OrgBrain 🧠
+# OrgBrain
 
-> Find who knows what — without leaving Slack.
+Identify team expertise and schedule availability directly inside Slack.
 
-OrgBrain is a Slack-native expertise discovery platform that builds a **living expertise map** of your organization by silently learning from public Slack conversations.
+![OrgBrain Dashboard Banner](global_assest/for_readme.png)
 
-No forms. No wikis. No manual tagging. Just ask.
-
----
-
-## What It Does
-
-Most organizations lose hours every week to one question: *"Who do I ask about this?"* OrgBrain answers that — instantly, inside Slack.
-
-It listens to how your team talks, extracts skills and roles automatically using Gemini AI, and makes that knowledge searchable the moment you need it.
+OrgBrain is a Slack-native organizational intelligence agent. By analyzing public conversation dynamics and structured commands, it automatically extracts employee capabilities, builds a real-time expertise map, and tracks availability without requiring manual profiles or form updates.
 
 ---
 
-## Core Features
-
-**Auto-Learning Profile Extraction**
-Uses Gemini (Vertex AI) to analyze public Slack messages and extract user skills and roles in the background. Low-confidence signals are filtered out to keep profiles clean and noise-free.
-
-**`/who-knows <skill>` — Expertise Discovery**
-Find domain experts without context-switching. Ask directly in Slack and get matched to the right person instantly.
-
-**Semantic Vector Search**
-Powered by Qdrant. Understands conceptual matches — searching "infra" surfaces Kubernetes experts. Searching "payments" finds Stripe specialists.
-
-**`/about <@user>` — Instant Profiles**
-Pull up a team member's inferred expertise, role context, and skills at a glance.
-
-**`/summarize <#channel>` — Channel Intelligence**
-Summarize what a channel has been discussing — useful for async catch-up and onboarding.
-
-**App Home Dashboard**
-A central hub showing your own profile, org-wide skill distribution, and search — all without leaving Slack.
-
----
-
-## Tech Stack
-
-| Layer | Technology |
-|---|---|
-| Slack Integration | Slack Bolt SDK (Socket Mode) |
-| AI / LLM | Gemini via Vertex AI |
-| Search | Real-Time Search (RTS) API |
-| Vector DB | Qdrant |
-| Primary DB | MongoDB Atlas |
-| Cache | Redis (Upstash) |
-| Backend | FastAPI |
-
----
-
-## How It Works
-
-```
-Slack message posted
-        ↓
-Gemini extracts skills + roles (with confidence filtering)
-        ↓
-Profile stored in MongoDB, embedding indexed in Qdrant
-        ↓
-/who-knows query → semantic search → ranked expert list → posted in Slack
-```
-
----
-
-## Slash Commands
-
-| Command | What it does |
-|---|---|
-| `/who-knows <skill>` | Find experts for a skill or topic |
-| `/about <@user>` | View a team member's inferred profile |
-| `/summarize <#channel>` | Get an AI summary of channel activity |
-| `/intro` | Onboard yourself and set profile context |
-
----
-
-## How to Run
+## Quickstart
 
 ### 1. Prerequisites
-Ensure you have Python 3.10+ and Docker installed.
+Ensure Python 3.10+ and Docker are installed on the host machine.
 
-### 2. Environment Setup
-Copy the example environment file and fill in your API keys and tokens:
+### 2. Configuration
+Copy the template configuration file to the backend directory:
 ```bash
 cp .env.example backend/.env
 ```
-*(Configure MongoDB, Qdrant, Redis, Slack, and Vertex AI credentials in `backend/.env`)*
+Populate `backend/.env` with the necessary API keys and credentials for MongoDB, Qdrant, Redis, Slack, and Google Cloud Vertex AI.
 
-### 3. Start Infrastructure
-Launch the local database and services containerized:
+### 3. Start Databases
+Launch local containerized database infrastructure:
 ```bash
 docker compose up -d
 ```
 
-### 4. Install Dependencies
-Set up your virtual environment and install the required Python packages:
+### 4. Installation
+Create a virtual environment and install the required dependencies:
 ```bash
 python -m venv .venv
-# On Windows:
+
+# Activate on Windows:
 .venv\Scripts\activate
-# On macOS/Linux:
+
+# Activate on macOS/Linux:
 source .venv/bin/activate
 
 pip install -r requirements.txt
 ```
 
-### 5. Start the Services
+### 5. Run Services
+Run both services in separate terminals to start the application:
 
-#### Run the Slack Bot (Socket Mode)
-For local development, start the Slack Socket Mode daemon:
-```bash
-python -m backend.slack_app
-```
+*   **Slack Integration (Socket Mode):**
+    ```bash
+    python -m backend.slack_app
+    ```
 
-#### Run the FastAPI Server & Dashboard
-Start the web dashboard and REST API endpoints:
-```bash
-python -m uvicorn backend.main:app --reload --port 8000
-```
-Visit `http://localhost:8000` to view the web dashboard.
+*   **FastAPI Dashboard & REST API:**
+    ```bash
+    python -m uvicorn backend.main:app --reload --port 8000
+    ```
+
+Access the dashboard at `http://localhost:8000`.
 
 ---
 
-## Built For
+## Core Features
 
-The **Slack Agent Builder Challenge** — Organizations Track.
+*   **Automated Capability Extraction:** Automatically parses public messages using Gemini on Vertex AI to build employee profiles. Low-confidence extractions are automatically filtered out to preserve dataset quality.
+*   **Semantic Expert Discovery:** Matches users to skills using conceptual relationships (e.g., searching for "infrastructure" returns users tagged with Kubernetes).
+*   **Calendar & Availability Tracking:** Allows team members to declare their schedules and query team availability in real time using text-based slash commands or an interactive modal.
+*   **Channel Intelligence:** Creates automated activity summaries and permits semantic search query lookups across channel conversation history.
 
-OrgBrain is designed to scale across real enterprise teams, surface institutional knowledge that would otherwise stay siloed, and make expert-finding a zero-friction, zero-context-switch experience.
+---
+
+## Slash Commands
+
+| Command | Function |
+|---|---|
+| `/who-knows <skill>` | Search for team members with a specific skill or area of expertise. |
+| `/about <@user>` | Retrieve the automatically generated profile for a specific user. |
+| `/summarize <#channel>` | Open an interactive modal summarizing recent conversation history. |
+| `/recall <query>` | Conduct a semantic search query across public channel memories. |
+| `/calendar` | Open the interactive schedule planner modal. |
+| `/calendar status <status> on <date>` | Declare availability (e.g., `/calendar status leave on May 5`). |
+| `/calendar who-is-free <date>` | List all team members who are free on a given date. |
+| `/calendar team-calendar` | Display an overview of the upcoming schedule for the team. |
+| `/intro <introduction>` | Introduce yourself manually to register skills. |
+
+---
+
+## Technical Architecture
+
+```
+Slack Message Ingestion
+        │
+        ▼
+Vertex AI Gemini Extraction (Confidence Filtering Applied)
+        │
+        ▼
+MongoDB (Profiles & Metadata) & Qdrant (Vector Embeddings)
+        │
+        ▼
+Semantic Match / Search Execution -> Slack Block Kit Output
+```
+
+### Stack Components
+*   **Slack Bolt SDK:** Powers the interactive Slack application and Socket Mode listener.
+*   **Vertex AI (Gemini):** Extracts structured capabilities and generates natural-language profiles.
+*   **MongoDB Atlas:** Stores structured employee profiles and metadata.
+*   **Qdrant:** Houses high-dimensional vector embeddings for semantic search.
+*   **Redis (Upstash):** Handles caching layer and memory indexes.
+*   **FastAPI:** Serves the backend API endpoints and web dashboard.
+
+---
+
+## Deployment Guidelines
+
+For production environments, the recommended path is deploying to **Google Cloud Run**:
+*   The application includes a standard `Dockerfile` that packages the FastAPI application.
+*   By configuring a GCP Service Account with the appropriate Vertex AI permissions, Cloud Run handles GCP API authentication natively without requiring storage of a service account private key file in the container.
+*   Ensure the Slack application configuration is switched from Socket Mode to HTTP Webhook Mode, pointing to the `/slack/events` endpoint.
+*   Utilize managed serverless offerings for database infrastructure (MongoDB Atlas, Upstash Redis, and Qdrant Cloud) to avoid container management overhead.
+
+---
+
+## Project Status
+
+Developed for the **Slack Agent Builder Challenge** (Organizations Track). OrgBrain is built to scale across enterprise Slack workspaces, uncovering institutional knowledge that is typically lost in chat history.

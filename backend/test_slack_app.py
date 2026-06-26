@@ -41,7 +41,7 @@ class TestBuildWhoKnowsBlocks:
 
     def test_empty_results(self):
         blocks = build_who_knows_blocks("rust", [])
-        assert blocks[0]["type"] == "header"
+        assert blocks[0]["type"] == "section"
         assert "rust" in blocks[0]["text"]["text"]
         assert any("No profiles found" in b.get("text", {}).get("text", "") for b in blocks)
 
@@ -516,4 +516,91 @@ class TestRecallSlashCommand:
         assert "Redis cluster migration completed" in body
         assert "<#C456>" in body
         assert "Aditya" in body
+
+
+class TestTeamJoinEventHandler:
+    """Tests for the team_join welcome DM event handler."""
+
+    def test_team_join_sends_welcome_dm_with_skills(self):
+        from unittest.mock import MagicMock, patch
+        from backend.slack_app import register_handlers
+
+        mock_app = MagicMock()
+        mock_storage = MagicMock()
+        mock_storage.get_top_skills.return_value = ["kubernetes", "python"]
+        
+        profile1 = EmployeeProfile(person="Priya Sharma", role="Backend Engineer", skills=["kubernetes"])
+        profile2 = EmployeeProfile(person="Marcus Chen", role="ML Engineer", skills=["python"])
+        
+        def mock_search(skill, limit=3):
+            if skill == "kubernetes":
+                return [profile1]
+            if skill == "python":
+                return [profile2]
+            return []
+            
+        mock_storage.search_by_skill.side_effect = mock_search
+
+        handlers = {}
+        def mock_event(event_name):
+            def decorator(func):
+                handlers[event_name] = func
+                return func
+            return decorator
+            
+        mock_app.event.side_effect = mock_event
+
+        register_handlers(mock_app, MagicMock(), mock_storage)
+
+        team_join_handler = handlers.get("team_join")
+        assert team_join_handler is not None
+
+        mock_client = MagicMock()
+        event_payload = {"user": {"id": "U123456"}}
+        
+        team_join_handler(event_payload, mock_client)
+
+        mock_client.chat_postMessage.assert_called_once()
+        call_args = mock_client.chat_postMessage.call_args
+        assert call_args.kwargs["channel"] == "U123456"
+        blocks_str = str(call_args.kwargs["blocks"])
+        assert "Priya Sharma" in blocks_str
+        assert "Marcus Chen" in blocks_str
+        assert "Kubernetes" in blocks_str
+        assert "Python" in blocks_str
+
+    def test_team_join_fallback_when_no_skills(self):
+        from unittest.mock import MagicMock
+        from backend.slack_app import register_handlers
+
+        mock_app = MagicMock()
+        mock_storage = MagicMock()
+        mock_storage.get_top_skills.return_value = []
+
+        handlers = {}
+        def mock_event(event_name):
+            def decorator(func):
+                handlers[event_name] = func
+                return func
+            return decorator
+            
+        mock_app.event.side_effect = mock_event
+
+        register_handlers(mock_app, MagicMock(), mock_storage)
+
+        team_join_handler = handlers.get("team_join")
+        assert team_join_handler is not None
+
+        mock_client = MagicMock()
+        event_payload = {"user": {"id": "U123456"}}
+        
+        team_join_handler(event_payload, mock_client)
+
+        mock_client.chat_postMessage.assert_called_once()
+        call_args = mock_client.chat_postMessage.call_args
+        assert call_args.kwargs["channel"] == "U123456"
+        blocks_str = str(call_args.kwargs["blocks"])
+        assert "currently empty" in blocks_str
+        assert "/intro" in blocks_str
+
 

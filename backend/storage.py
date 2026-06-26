@@ -215,6 +215,25 @@ class ProfileStorage:
             "profile_count": count,
         }
 
+    def get_top_skills(self, limit: int = 3) -> list[str]:
+        """
+        Aggregate profiles to find the most common skills in the workspace.
+
+        Args:
+            limit: Maximum number of top skills to return.
+
+        Returns:
+            List of top skill names.
+        """
+        pipeline = [
+            {"$unwind": "$skills"},
+            {"$group": {"_id": "$skills", "count": {"$sum": 1}}},
+            {"$sort": {"count": -1}},
+            {"$limit": limit}
+        ]
+        cursor = self._collection.aggregate(pipeline)
+        return [doc["_id"] for doc in cursor]
+
     def delete_profile(self, person: str) -> bool:
         """
         Delete an employee profile by person identifier.

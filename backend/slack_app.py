@@ -471,14 +471,16 @@ def build_who_knows_blocks(
     Args:
         skill: The skill search term.
         profiles: Matching EmployeeProfile instances.
+        match_reasons: Optional explanation of why they matched.
 
     Returns:
         Block Kit block list.
     """
+    title_text = f"Who knows *{skill.strip()}*?"
     blocks: list[dict[str, Any]] = [
         {
-            "type": "header",
-            "text": {"type": "plain_text", "text": f"Who knows {skill}?"},
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"🔍 *Expertise Search Results: {title_text}*"},
         },
         {"type": "divider"},
     ]
@@ -491,22 +493,50 @@ def build_who_knows_blocks(
                     "type": "mrkdwn",
                     "text": (
                         f"No profiles found for *{skill}* yet.\n"
-                        "Post expertise in a channel and Org Brain will learn automatically."
+                        "Post expertise in a public channel and OrgBrain will index them automatically."
                     ),
                 },
             }
         )
         return blocks
 
-    for profile in profiles:
+    for i, profile in enumerate(profiles):
         role_line = f"*{profile.role}*" if profile.role else "_Role unknown_"
         reason = (match_reasons or {}).get(profile.person)
+        
+        # Build skills and projects lines
+        skills_str = ", ".join(profile.skills[:5]) if profile.skills else "None listed"
+        
+        # Build description text block
+        text_lines = [
+            f"*{i+1}. {profile.person}* — {role_line}",
+            f"*Skills:* {skills_str}"
+        ]
         if reason:
-            text = f"*{profile.person}* — {role_line}\n_{reason}_"
+            text_lines.append(f"*Match Reason:* _{reason}_")
         else:
-            mini = build_profile_mini_description(profile)
-            text = f"*{profile.person}* — {role_line}\n{mini}"
-        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": text}})
+            mini_desc = build_profile_mini_description(profile)
+            if mini_desc:
+                text_lines.append(f"*Details:* {mini_desc}")
+
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": "\n".join(text_lines)
+            },
+            "accessory": {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "View Profile", "emoji": False},
+                "value": profile.person,
+                "action_id": "home_request_about"
+            }
+        })
+        blocks.append({"type": "divider"})
+
+    # Remove the last trailing divider for cleaner visuals
+    if blocks and blocks[-1]["type"] == "divider":
+        blocks.pop()
 
     blocks.append(
         {
@@ -514,7 +544,7 @@ def build_who_knows_blocks(
             "elements": [
                 {
                     "type": "mrkdwn",
-                    "text": f"Found {len(profiles)} profile(s) · powered by Org Brain",
+                    "text": f"Found {len(profiles)} profile(s) matching your query · Powered by OrgBrain",
                 }
             ],
         }
@@ -735,6 +765,113 @@ def register_handlers(
             print(f"\n[Slack HTTP Request] Received command: {body.get('command')} with text: \"{body.get('text')}\"")
             logger.info("Slack command: %s", body.get("command"))
         return next()
+
+    @app.event("team_join")
+    def handle_team_join(event: dict[str, Any], client) -> None:
+        """Send a welcome DM to new workspace members listing the top experts."""
+        user_id = event.get("user", {}).get("id")
+        if not user_id:
+            logger.warning("No user ID found in team_join event payload")
+            return
+
+        print(f"\n[Slack Event] Acknowledged: team_join for User @{user_id}")
+        logger.info("New user joined the workspace: %s", user_id)
+
+        try:
+            top_skills = storage.get_top_skills(limit=3)
+            blocks = []
+            if top_skills:
+                blocks = [
+                    {
+                        "type": "header",
+                        "text": {
+                            "type": "plain_text",
+                            "text": "Welcome to the workspace!",
+                            "emoji": False
+                        }
+                    },
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": "Hello! I am *OrgBrain*, your workspace intelligence assistant. I map team expertise and organize collective memory directly inside Slack."
+                        }
+                    },
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": "Here is a quick directory of who to talk to for the most common topics in our team:"
+                        }
+                    },
+                    {"type": "divider"}
+                ]
+
+                for skill in top_skills:
+                    profiles = storage.search_by_skill(skill, limit=3)
+                    if profiles:
+                        names_list = []
+                        for p in profiles:
+                            role_text = f" ({p.role})" if p.role else ""
+                            names_list.append(f"• *{p.person}*{role_text}")
+                        experts_text = "\n".join(names_list)
+                    else:
+                        experts_text = "_No profiles found yet_"
+
+                    blocks.append({
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f"*Top Expertise: {skill.capitalize()}*\n{experts_text}"
+                        }
+                    })
+
+                blocks.extend([
+                    {"type": "divider"},
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": "Need to find someone else? Try running `/who-knows <skill>` (e.g., `/who-knows Kubernetes`) in any channel!"
+                        }
+                    }
+                ])
+            else:
+                blocks = [
+                    {
+                        "type": "header",
+                        "text": {
+                            "type": "plain_text",
+                            "text": "Welcome to the workspace!",
+                            "emoji": False
+                        }
+                    },
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": "Hello! I am *OrgBrain*, your workspace intelligence assistant. I map team expertise and organize collective memory directly inside Slack."
+                        }
+                    },
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": "Since we are just setting things up, our expertise map is currently empty. You can register your own skills and introduce yourself by running the `/intro` command:\n`/intro I am Name, Role, expert in skill1, skill2`"
+                        }
+                    }
+                ]
+
+            client.chat_postMessage(
+                channel=user_id,
+                blocks=blocks,
+                text="Welcome to the workspace! I am OrgBrain."
+            )
+            print(f"   [Onboarding DM] SUCCESS: Sent onboarding welcome DM to User @{user_id}")
+            logger.info("Sent onboarding welcome DM to %s", user_id)
+        except Exception as exc:
+            logger.exception("Failed to send onboarding welcome DM")
+            print(f"   [Onboarding DM] FAILED: Could not welcome User @{user_id}: {exc}")
 
     @app.event("message")
     def handle_message(event: dict[str, Any], logger: logging.Logger) -> None:
